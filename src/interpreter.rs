@@ -11,6 +11,15 @@ pub enum Value {
     // Range(Option<i64>, Option<i64>),
 }
 
+impl Value {
+    pub fn typeid(&self) -> TypeId {
+        match self {
+            Value::Number(_) => TypeId::Number,
+            Value::List(_) => TypeId::List,
+        }
+    }
+}
+
 impl Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -25,6 +34,21 @@ impl Display for Value {
                 }
                 write!(f, "]")
             }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum TypeId {
+    Number,
+    List,
+}
+
+impl Display for TypeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TypeId::Number => write!(f, "number"),
+            TypeId::List => write!(f, "list"),
         }
     }
 }
@@ -75,8 +99,21 @@ impl Interpreter {
                 Err(e) => {
                     return Err(anyhow::anyhow!("{}", e.into_contextual(source)));
                 }
-                Ok(token) => {
-                    self.eval_token(token)?;
+                Ok((span, token)) => {
+                    self.eval_token(token).map_err(|e| {
+                        anyhow::anyhow!(
+                            "{}",
+                            chic::Error::new(e.to_string())
+                                .error(
+                                    span.line_number,
+                                    span.char_offset,
+                                    span.char_offset + span.length,
+                                    source,
+                                    "here",
+                                )
+                                .to_string()
+                        )
+                    })?;
                 }
             }
         }
@@ -129,7 +166,13 @@ impl Interpreter {
             Token::Instruction(Instruction::Repeat) => {
                 let count = match self.try_pop()? {
                     Value::Number(n) => n as usize,
-                    _ => return Err(anyhow::anyhow!("Invalid type for repeat count")),
+                    value => {
+                        return Err(anyhow::anyhow!(
+                            "Invalid type for repeat count (wanted a {}, got a {})",
+                            TypeId::Number,
+                            value.typeid()
+                        ))
+                    }
                 };
 
                 let value_to_repeat = self.try_pop()?;
@@ -221,10 +264,15 @@ mod parser {
     use super::{Instruction, Token};
 
     #[derive(Debug)]
+    pub struct Span {
+        pub line_number: usize,
+        pub char_offset: usize,
+        pub length: usize,
+    }
+
+    #[derive(Debug)]
     pub struct TokenizerError {
-        line_number: usize,
-        char_offset: usize,
-        span_length: usize,
+        span: Span,
         message: String,
         label: Option<String>,
         help: Option<String>,
@@ -246,7 +294,11 @@ mod parser {
                 write!(f, " ({})", label)?;
             }
 
-            write!(f, " at line {} char {}", self.line_number, self.char_offset)?;
+            write!(
+                f,
+                " at line {} char {}",
+                self.span.line_number, self.span.char_offset
+            )?;
 
             if let Some(help) = &self.help {
                 write!(f, " - {}", help)?;
@@ -267,9 +319,9 @@ mod parser {
     impl Display for ContextualTokenizerError<'_> {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             let mut printable_error = chic::Error::new(self.inner.message.clone()).error(
-                self.inner.line_number,
-                self.inner.char_offset,
-                self.inner.char_offset + self.inner.span_length,
+                self.inner.span.line_number,
+                self.inner.span.char_offset,
+                self.inner.span.char_offset + self.inner.span.length,
                 self.source,
                 self.inner
                     .label
@@ -300,10 +352,10 @@ mod parser {
     }
 
     impl<'a> Iterator for TokenIterator<'a> {
-        type Item = Result<Token, TokenizerError>;
+        type Item = Result<(Span, Token), TokenizerError>;
 
         fn next(&mut self) -> Option<Self::Item> {
-            match self.inner_iter.peek() {
+            match self.inner_iter.peek().cloned() {
                 Some((char_offset, c)) => match c {
                     '0'..='9' => {
                         let mut number = String::new();
@@ -316,22 +368,36 @@ mod parser {
                             }
                         }
 
-                        Some(Ok(Token::NumberLiteral(number.parse().unwrap())))
+                        let span = Span {
+                            line_number: self.line_number,
+                            char_offset,
+                            length: number.len(),
+                        };
+
+                        Some(Ok((span, Token::NumberLiteral(number.parse().unwrap()))))
                     }
                     '\n' => {
                         self.line_number += 1;
                         self.inner_iter.next();
                         self.next()
                     }
-                    _ => match Instruction::try_from(*c) {
+                    _ => match Instruction::try_from(c) {
                         Some(command) => {
                             self.inner_iter.next();
-                            Some(Ok(Token::Instruction(command)))
+                            let span = Span {
+                                line_number: self.line_number,
+                                char_offset,
+                                length: 1,
+                            };
+
+                            Some(Ok((span, Token::Instruction(command))))
                         }
                         None => Some(Err(TokenizerError {
-                            line_number: self.line_number,
-                            char_offset: *char_offset,
-                            span_length: 1,
+                            span: Span {
+                                line_number: self.line_number,
+                                char_offset,
+                                length: 1,
+                            },
                             message: format!("Unknown instruction '{}'", c),
                             label: Some(String::from("unknown instruction")),
                             help: None,
