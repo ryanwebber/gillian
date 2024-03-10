@@ -7,12 +7,12 @@ A stack-based code golfing language.
 cargo build --release
 
 # Print the first 100 fibinacci numbers
-echo 'p1pCR{2P+' | ./target/release/gillian
+echo 'p1pC{2P+' | ./target/release/gillian
 #  p: Duplicate the top value on the stack. The stack is empty, so a 0 is pushed instead. The stack now contains [0].
 #  1: Push the number 1 to the stack. The stack now contains [0, 1].
 #  p: Duplicate the top value on the stack. The stack now contains [0, 1, 1].
 #  C: Multiply the top value on the stack by 100. The stack now contains [0, 1, 100].
-#  {: Pop 100 off the stack. Run the following block (terminated by EOF) 100 times.
+#  {: Pop 100 off the stack. Run the following block (implicitly terminated by EOF) 100 times.
 #      2: Push the number 2 to the stack.
 #      P: Pop 2 off the stack. Duplicate the top 2 values on the stack. The stack now contains [0, 1, 0, 1].
 #      +: Pop the top 2 values off the stack and add them. The stack now contains [0, 1, 1].
