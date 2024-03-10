@@ -17,6 +17,48 @@ impl Value {
             Value::String(_) => TypeId::String,
         }
     }
+
+    fn try_for_each(
+        self,
+        mut f: impl FnMut(LoopContext) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        match self {
+            Value::List(values) => {
+                for (i, value) in values.iter().enumerate() {
+                    f(LoopContext {
+                        element: value.clone(),
+                        iteration: Value::Number(i as f64),
+                    })?;
+                }
+
+                Ok(())
+            }
+            Value::Range(range) => {
+                for (i, v) in range.clone().enumerate() {
+                    f(LoopContext {
+                        element: Value::Number(v as f64),
+                        iteration: Value::Number(i as f64),
+                    })?;
+                }
+
+                Ok(())
+            }
+            Value::Number(n) => {
+                for i in 0..n as i64 {
+                    f(LoopContext {
+                        element: Value::Number(i as f64),
+                        iteration: Value::Number(i as f64),
+                    })?;
+                }
+
+                Ok(())
+            }
+            value => Err(anyhow::anyhow!(
+                "Value is not iterable (got a {})",
+                value.typeid()
+            )),
+        }
+    }
 }
 
 impl Display for Value {
@@ -80,6 +122,7 @@ pub enum Instruction {
     Add1,
     Exec,
     For,
+    Map,
     Mul,
     Mul1,
     Mul2,
@@ -226,39 +269,33 @@ impl Interpreter {
                 Ok(())
             }
             Token::Instruction(Instruction::For) => match (self.pop(), self.pop()) {
-                (Value::String(body), Value::Range(range)) => {
-                    for (i, v) in range.enumerate() {
-                        self.eval_with_context(
-                            &body,
-                            global_source,
-                            Some(LoopContext {
-                                element: Value::Number(v as f64),
-                                iteration: Value::Number(i as f64),
-                            }),
-                        )?;
-                    }
-
-                    Ok(())
-                }
-                (Value::String(body), Value::Number(count)) => {
-                    for i in 0..count as i64 {
-                        self.eval_with_context(
-                            &body,
-                            global_source,
-                            Some(LoopContext {
-                                element: Value::Number(i as f64),
-                                iteration: Value::Number(i as f64),
-                            }),
-                        )?;
-                    }
-
-                    Ok(())
-                }
-                (lhs, rhs) => {
+                (Value::String(body), iterable) => iterable.try_for_each(|loop_context| {
+                    self.eval_with_context(&body, global_source, Some(loop_context))
+                }),
+                (body, _) => {
                     return Err(anyhow::anyhow!(
-                        "Invalid types for for loop (got a {} and a {})",
-                        lhs.typeid(),
-                        rhs.typeid()
+                        "Value is not an executable string (got a {})",
+                        body.typeid(),
+                    ))
+                }
+            },
+            Token::Instruction(Instruction::Map) => match (self.pop(), self.pop()) {
+                (Value::String(body), iterable) => {
+                    let mut values = Vec::new();
+                    iterable.try_for_each(|loop_context| {
+                        self.eval_with_context(&body, global_source, Some(loop_context))?;
+                        values.push(self.pop());
+                        Ok(())
+                    })?;
+
+                    self.push(Value::List(values));
+
+                    Ok(())
+                }
+                (body, _) => {
+                    return Err(anyhow::anyhow!(
+                        "Value is not an executable string (got a {})",
+                        body.typeid(),
                     ))
                 }
             },
@@ -391,7 +428,11 @@ impl Interpreter {
     fn eval_binary_operator<Op: operator::BinaryOperator>(&mut self) -> anyhow::Result<()> {
         // Replace ranges with lists if we're applying a binary operator
         for i in 0..2 {
-            let index = self.stack.len() - i - 1;
+            if self.stack.len() <= i {
+                break;
+            }
+
+            let index: usize = self.stack.len() - i - 1;
             if let Some(value) = self.stack.get_mut(index) {
                 if let Value::Range(range) = value {
                     *value = Value::List(range.map(|i| Value::Number(i as f64)).collect())
@@ -604,28 +645,7 @@ mod parser {
 
                         Some(Ok((span, Token::NumberLiteral(number.parse().unwrap()))))
                     }
-                    '"' => {
-                        self.inner_iter.next();
-                        let mut string = String::new();
-                        while let Some((_, c)) = self.inner_iter.peek() {
-                            if *c == '"' {
-                                self.inner_iter.next();
-                                break;
-                            } else {
-                                string.push(*c);
-                                self.inner_iter.next();
-                            }
-                        }
-
-                        let span = Span {
-                            line_number: self.line_number,
-                            char_offset,
-                            length: string.len(),
-                        };
-
-                        Some(Ok((span, Token::StringLiteral(string))))
-                    }
-                    '{' => {
+                    '"' | '{' | 'm' => {
                         self.inner_iter.next();
                         let mut string = String::new();
                         while let Some((_, c)) = self.inner_iter.peek() {
@@ -644,7 +664,16 @@ mod parser {
                             length: string.len(),
                         };
 
-                        self.yield_next = Some((span, Token::Instruction(Instruction::For)));
+                        match c {
+                            '{' => {
+                                self.yield_next = Some((span, Token::Instruction(Instruction::For)))
+                            }
+                            'm' => {
+                                self.yield_next = Some((span, Token::Instruction(Instruction::Map)))
+                            }
+                            _ => {}
+                        }
+
                         Some(Ok((span, Token::StringLiteral(string))))
                     }
                     _ => match Instruction::try_from(c) {
