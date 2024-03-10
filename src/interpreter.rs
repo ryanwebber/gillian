@@ -1,14 +1,10 @@
-use std::fmt::Display;
-
-use self::operator::Multiply;
+use std::{fmt::Display, ops::Range};
 
 #[derive(Debug, Clone)]
 pub enum Value {
     Number(f64),
     List(Vec<Value>),
-    // String(String),
-    // Boolean(bool),
-    // Range(Option<i64>, Option<i64>),
+    Range(Range<i64>),
 }
 
 impl Value {
@@ -16,6 +12,7 @@ impl Value {
         match self {
             Value::Number(_) => TypeId::Number,
             Value::List(_) => TypeId::List,
+            Value::Range(_) => TypeId::Range,
         }
     }
 }
@@ -34,6 +31,16 @@ impl Display for Value {
                 }
                 write!(f, "]")
             }
+            Value::Range(range) => {
+                for (i, n) in range.clone().enumerate() {
+                    if i > 0 {
+                        write!(f, " ")?;
+                    }
+                    write!(f, "{}", n)?;
+                }
+
+                Ok(())
+            }
         }
     }
 }
@@ -42,6 +49,7 @@ impl Display for Value {
 pub enum TypeId {
     Number,
     List,
+    Range,
 }
 
 impl Display for TypeId {
@@ -49,6 +57,7 @@ impl Display for TypeId {
         match self {
             TypeId::Number => write!(f, "number"),
             TypeId::List => write!(f, "list"),
+            TypeId::Range => write!(f, "range"),
         }
     }
 }
@@ -59,24 +68,34 @@ pub enum Token {
 }
 
 pub enum Instruction {
+    Add,
+    Add1,
     Mul,
     Mul1,
     Mul2,
     Mul10,
     Mul100,
     Mul1000,
+    Push,
+    PushN,
+    RangeTo,
     Repeat,
 }
 
 impl Instruction {
     pub fn try_from(c: char) -> Option<Instruction> {
         match c {
+            '+' => Some(Instruction::Add),
+            'A' => Some(Instruction::Add1),
             '*' => Some(Instruction::Mul),
             'I' => Some(Instruction::Mul1),
             '@' => Some(Instruction::Mul2),
             'X' => Some(Instruction::Mul10),
             'C' => Some(Instruction::Mul100),
             'M' => Some(Instruction::Mul1000),
+            'p' => Some(Instruction::Push),
+            'P' => Some(Instruction::PushN),
+            'R' => Some(Instruction::RangeTo),
             '.' => Some(Instruction::Repeat),
             _ => None,
         }
@@ -139,9 +158,17 @@ impl Interpreter {
                 self.stack.push(Value::Number(n));
                 Ok(())
             }
+            Token::Instruction(Instruction::Add) => {
+                // Simple addition with top 2 values
+                self.eval_binary_operator::<operator::Add>()
+            }
+            Token::Instruction(Instruction::Add1) => {
+                self.push(Value::Number(1.0));
+                self.eval_binary_operator::<operator::Add>()
+            }
             Token::Instruction(Instruction::Mul) => {
                 // Simple multiplication with top 2 values
-                self.eval_binary_operator::<Multiply>()
+                self.eval_binary_operator::<operator::Multiply>()
             }
             Token::Instruction(Instruction::Mul1) => {
                 // No-op, this is basically a number literal separator
@@ -149,22 +176,61 @@ impl Interpreter {
             }
             Token::Instruction(Instruction::Mul2) => {
                 self.push(Value::Number(2.0));
-                self.eval_binary_operator::<Multiply>()
+                self.eval_binary_operator::<operator::Multiply>()
             }
             Token::Instruction(Instruction::Mul10) => {
                 self.push(Value::Number(10.0));
-                self.eval_binary_operator::<Multiply>()
+                self.eval_binary_operator::<operator::Multiply>()
             }
             Token::Instruction(Instruction::Mul100) => {
                 self.push(Value::Number(100.0));
-                self.eval_binary_operator::<Multiply>()
+                self.eval_binary_operator::<operator::Multiply>()
             }
             Token::Instruction(Instruction::Mul1000) => {
                 self.push(Value::Number(1000.0));
-                self.eval_binary_operator::<Multiply>()
+                self.eval_binary_operator::<operator::Multiply>()
+            }
+            Token::Instruction(Instruction::Push) => {
+                if let Some(value) = self.stack.last().cloned() {
+                    self.push(value);
+                }
+
+                Ok(())
+            }
+            Token::Instruction(Instruction::PushN) => {
+                let count = match self.pop() {
+                    Value::Number(n) => n as usize,
+                    value => {
+                        return Err(anyhow::anyhow!(
+                            "Invalid type for push count (wanted a {}, got a {})",
+                            TypeId::Number,
+                            value.typeid()
+                        ))
+                    }
+                };
+
+                let values = (0..count).map(|i| self.peek(i)).collect::<Vec<Value>>();
+                self.stack.extend(values.into_iter().rev());
+
+                Ok(())
+            }
+            Token::Instruction(Instruction::RangeTo) => {
+                let end = match self.pop() {
+                    Value::Number(n) => n as i64,
+                    value => {
+                        return Err(anyhow::anyhow!(
+                            "Invalid type for range end (wanted a {}, got a {})",
+                            TypeId::Number,
+                            value.typeid()
+                        ))
+                    }
+                };
+
+                self.push(Value::Range(0..end));
+                Ok(())
             }
             Token::Instruction(Instruction::Repeat) => {
-                let count = match self.try_pop()? {
+                let count = match self.pop() {
                     Value::Number(n) => n as usize,
                     value => {
                         return Err(anyhow::anyhow!(
@@ -175,7 +241,7 @@ impl Interpreter {
                     }
                 };
 
-                let value_to_repeat = self.try_pop()?;
+                let value_to_repeat = self.pop();
                 let repeated_value = (0..count)
                     .into_iter()
                     .map(|_| value_to_repeat.clone())
@@ -191,14 +257,30 @@ impl Interpreter {
         self.stack.push(value);
     }
 
-    fn try_pop(&mut self) -> anyhow::Result<Value> {
-        self.stack
-            .pop()
-            .ok_or_else(|| anyhow::anyhow!("Stack underflow"))
+    fn pop(&mut self) -> Value {
+        self.stack.pop().unwrap_or_else(|| Value::Number(0.0))
+    }
+
+    fn peek(&self, i: usize) -> Value {
+        if i < self.stack.len() {
+            self.stack[self.stack.len() - i - 1].clone()
+        } else {
+            Value::Number(0.0)
+        }
     }
 
     fn eval_binary_operator<Op: operator::BinaryOperator>(&mut self) -> anyhow::Result<()> {
-        let value = match (self.try_pop()?, self.try_pop()?) {
+        // Replace ranges with lists if we're applying a binary operator
+        for i in 0..2 {
+            let index = self.stack.len() - i - 1;
+            if let Some(value) = self.stack.get_mut(index) {
+                if let Value::Range(range) = value {
+                    *value = Value::List(range.map(|i| Value::Number(i as f64)).collect())
+                }
+            }
+        }
+
+        let value = match (self.pop(), self.pop()) {
             (Value::List(lhs), Value::List(rhs)) => {
                 let result = lhs
                     .into_iter()
@@ -248,6 +330,17 @@ mod operator {
             match (lhs, rhs) {
                 (Value::Number(lhs), Value::Number(rhs)) => Ok(Value::Number(lhs * rhs)),
                 _ => Err(anyhow::anyhow!("Invalid types for multiplication")),
+            }
+        }
+    }
+
+    pub struct Add;
+
+    impl BinaryOperator for Add {
+        fn apply_binary_operator(lhs: Value, rhs: Value) -> anyhow::Result<Value> {
+            match (lhs, rhs) {
+                (Value::Number(lhs), Value::Number(rhs)) => Ok(Value::Number(lhs + rhs)),
+                _ => Err(anyhow::anyhow!("Invalid types for addition")),
             }
         }
     }
