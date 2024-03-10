@@ -31,7 +31,13 @@ fn run(args: &Gilligan) -> anyhow::Result<()> {
     };
 
     let mut interpreter = Interpreter::new();
-    interpreter.evaluate(&program_source)
+    interpreter.evaluate(&program_source)?;
+
+    for value in interpreter.exit_values() {
+        println!("{}", value);
+    }
+
+    Ok(())
 }
 
 fn main() {

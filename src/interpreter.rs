@@ -5,6 +5,7 @@ pub enum Value {
     Number(f64),
     List(Vec<Value>),
     Range(Range<i64>),
+    String(String),
 }
 
 impl Value {
@@ -13,6 +14,7 @@ impl Value {
             Value::Number(_) => TypeId::Number,
             Value::List(_) => TypeId::List,
             Value::Range(_) => TypeId::Range,
+            Value::String(_) => TypeId::String,
         }
     }
 }
@@ -41,6 +43,7 @@ impl Display for Value {
 
                 Ok(())
             }
+            Value::String(s) => write!(f, "{}", s),
         }
     }
 }
@@ -50,6 +53,7 @@ pub enum TypeId {
     Number,
     List,
     Range,
+    String,
 }
 
 impl Display for TypeId {
@@ -58,18 +62,24 @@ impl Display for TypeId {
             TypeId::Number => write!(f, "number"),
             TypeId::List => write!(f, "list"),
             TypeId::Range => write!(f, "range"),
+            TypeId::String => write!(f, "string"),
         }
     }
 }
 
+#[derive(Debug, Clone)]
 pub enum Token {
     Instruction(Instruction),
     NumberLiteral(f64),
+    StringLiteral(String),
 }
 
+#[derive(Debug, Clone)]
 pub enum Instruction {
     Add,
     Add1,
+    Exec,
+    For,
     Mul,
     Mul1,
     Mul2,
@@ -87,6 +97,8 @@ impl Instruction {
         match c {
             '+' => Some(Instruction::Add),
             'A' => Some(Instruction::Add1),
+            'E' => Some(Instruction::Exec),
+            'F' => Some(Instruction::For),
             '*' => Some(Instruction::Mul),
             'I' => Some(Instruction::Mul1),
             '@' => Some(Instruction::Mul2),
@@ -109,6 +121,14 @@ pub struct Interpreter {
 impl Interpreter {
     pub fn new() -> Interpreter {
         Interpreter { stack: Vec::new() }
+    }
+
+    pub fn exit_values<'a>(&'a self) -> &'a [Value] {
+        if let Some((Value::List(values), &[])) = self.stack.split_last() {
+            values
+        } else {
+            &self.stack
+        }
     }
 
     pub fn evaluate(&mut self, source: &str) -> anyhow::Result<()> {
@@ -137,18 +157,6 @@ impl Interpreter {
             }
         }
 
-        let unpacked_stack_values = {
-            if let Some((Value::List(values), &[])) = self.stack.split_last() {
-                values
-            } else {
-                &self.stack
-            }
-        };
-
-        for value in unpacked_stack_values {
-            println!("{}", value);
-        }
-
         Ok(())
     }
 
@@ -156,6 +164,10 @@ impl Interpreter {
         match token {
             Token::NumberLiteral(n) => {
                 self.stack.push(Value::Number(n));
+                Ok(())
+            }
+            Token::StringLiteral(s) => {
+                self.stack.push(Value::String(s));
                 Ok(())
             }
             Token::Instruction(Instruction::Add) => {
@@ -166,6 +178,48 @@ impl Interpreter {
                 self.push(Value::Number(1.0));
                 self.eval_binary_operator::<operator::Add>()
             }
+            Token::Instruction(Instruction::Exec) => {
+                let value = self.pop();
+                match value {
+                    Value::String(s) => {
+                        let mut interpreter = Interpreter::new();
+                        interpreter.evaluate(&s)?;
+                        self.stack.extend(interpreter.stack);
+                    }
+                    value => {
+                        return Err(anyhow::anyhow!(
+                            "Invalid type for exec (wanted a {}, got a {})",
+                            TypeId::String,
+                            value.typeid()
+                        ))
+                    }
+                }
+
+                Ok(())
+            }
+            Token::Instruction(Instruction::For) => match (self.pop(), self.pop()) {
+                (Value::String(body), Value::Range(range)) => {
+                    for _ in range {
+                        self.evaluate(&body)?;
+                    }
+
+                    Ok(())
+                }
+                (Value::String(body), Value::Number(count)) => {
+                    for _ in 0..count as i64 {
+                        self.evaluate(&body)?;
+                    }
+
+                    Ok(())
+                }
+                (lhs, rhs) => {
+                    return Err(anyhow::anyhow!(
+                        "Invalid types for for loop (got a {} and a {})",
+                        lhs.typeid(),
+                        rhs.typeid()
+                    ))
+                }
+            },
             Token::Instruction(Instruction::Mul) => {
                 // Simple multiplication with top 2 values
                 self.eval_binary_operator::<operator::Multiply>()
@@ -191,10 +245,7 @@ impl Interpreter {
                 self.eval_binary_operator::<operator::Multiply>()
             }
             Token::Instruction(Instruction::Push) => {
-                if let Some(value) = self.stack.last().cloned() {
-                    self.push(value);
-                }
-
+                self.push(self.peek(0));
                 Ok(())
             }
             Token::Instruction(Instruction::PushN) => {
@@ -356,7 +407,7 @@ mod parser {
 
     use super::{Instruction, Token};
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone, Copy)]
     pub struct Span {
         pub line_number: usize,
         pub char_offset: usize,
@@ -432,6 +483,7 @@ mod parser {
 
     pub struct TokenIterator<'a> {
         line_number: usize,
+        yield_next: Option<(Span, Token)>,
         inner_iter: Peekable<Enumerate<Chars<'a>>>,
     }
 
@@ -439,6 +491,7 @@ mod parser {
         pub fn new(source: &str) -> TokenIterator {
             TokenIterator {
                 line_number: 0,
+                yield_next: None,
                 inner_iter: source.chars().enumerate().peekable(),
             }
         }
@@ -448,6 +501,10 @@ mod parser {
         type Item = Result<(Span, Token), TokenizerError>;
 
         fn next(&mut self) -> Option<Self::Item> {
+            if let Some(next) = self.yield_next.take() {
+                return Some(Ok(next));
+            }
+
             match self.inner_iter.peek().cloned() {
                 Some((char_offset, c)) => match c {
                     '0'..='9' => {
@@ -473,6 +530,28 @@ mod parser {
                         self.line_number += 1;
                         self.inner_iter.next();
                         self.next()
+                    }
+                    '{' => {
+                        self.inner_iter.next();
+                        let mut string = String::new();
+                        while let Some((_, c)) = self.inner_iter.peek() {
+                            if *c == '}' {
+                                self.inner_iter.next();
+                                break;
+                            } else {
+                                string.push(*c);
+                                self.inner_iter.next();
+                            }
+                        }
+
+                        let span = Span {
+                            line_number: self.line_number,
+                            char_offset,
+                            length: string.len(),
+                        };
+
+                        self.yield_next = Some((span, Token::Instruction(Instruction::For)));
+                        Some(Ok((span, Token::StringLiteral(string))))
                     }
                     _ => match Instruction::try_from(c) {
                         Some(command) => {
