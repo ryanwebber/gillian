@@ -87,7 +87,10 @@ pub enum Instruction {
     Mul100,
     Mul1000,
     Push,
+    PushLoopIteration,
+    PushLoopElement,
     PushN,
+    PushSource,
     RangeTo,
     Repeat,
 }
@@ -106,12 +109,21 @@ impl Instruction {
             'C' => Some(Instruction::Mul100),
             'M' => Some(Instruction::Mul1000),
             'p' => Some(Instruction::Push),
+            '#' => Some(Instruction::PushLoopIteration),
+            '_' => Some(Instruction::PushLoopElement),
             'P' => Some(Instruction::PushN),
+            '$' => Some(Instruction::PushSource),
             'R' => Some(Instruction::RangeTo),
             '.' => Some(Instruction::Repeat),
             _ => None,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct LoopContext {
+    element: Value,
+    iteration: Value,
 }
 
 pub struct Interpreter {
@@ -131,7 +143,17 @@ impl Interpreter {
         }
     }
 
-    pub fn evaluate(&mut self, source: &str) -> anyhow::Result<()> {
+    pub fn eval(&mut self, source: &str) -> anyhow::Result<()> {
+        let source = source.trim();
+        self.eval_with_context(source, source, None)
+    }
+
+    fn eval_with_context(
+        &mut self,
+        source: &str,
+        global_source: &str,
+        loop_context: Option<LoopContext>,
+    ) -> anyhow::Result<()> {
         let mut token_iter = parser::TokenIterator::new(source);
         while let Some(token) = token_iter.next() {
             match token {
@@ -139,20 +161,21 @@ impl Interpreter {
                     return Err(anyhow::anyhow!("{}", e.into_contextual(source)));
                 }
                 Ok((span, token)) => {
-                    self.eval_token(token).map_err(|e| {
-                        anyhow::anyhow!(
-                            "{}",
-                            chic::Error::new(e.to_string())
-                                .error(
-                                    span.line_number,
-                                    span.char_offset,
-                                    span.char_offset + span.length,
-                                    source,
-                                    "here",
-                                )
-                                .to_string()
-                        )
-                    })?;
+                    self.eval_token(token, global_source, loop_context.clone())
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "{}",
+                                chic::Error::new(e.to_string())
+                                    .error(
+                                        span.line_number,
+                                        span.char_offset,
+                                        span.char_offset + span.length,
+                                        source,
+                                        "here",
+                                    )
+                                    .to_string()
+                            )
+                        })?;
                 }
             }
         }
@@ -160,7 +183,12 @@ impl Interpreter {
         Ok(())
     }
 
-    fn eval_token(&mut self, token: Token) -> anyhow::Result<()> {
+    fn eval_token(
+        &mut self,
+        token: Token,
+        global_source: &str,
+        loop_context: Option<LoopContext>,
+    ) -> anyhow::Result<()> {
         match token {
             Token::NumberLiteral(n) => {
                 self.stack.push(Value::Number(n));
@@ -183,7 +211,7 @@ impl Interpreter {
                 match value {
                     Value::String(s) => {
                         let mut interpreter = Interpreter::new();
-                        interpreter.evaluate(&s)?;
+                        interpreter.eval(&s)?;
                         self.stack.extend(interpreter.stack);
                     }
                     value => {
@@ -199,15 +227,29 @@ impl Interpreter {
             }
             Token::Instruction(Instruction::For) => match (self.pop(), self.pop()) {
                 (Value::String(body), Value::Range(range)) => {
-                    for _ in range {
-                        self.evaluate(&body)?;
+                    for (i, v) in range.enumerate() {
+                        self.eval_with_context(
+                            &body,
+                            global_source,
+                            Some(LoopContext {
+                                element: Value::Number(v as f64),
+                                iteration: Value::Number(i as f64),
+                            }),
+                        )?;
                     }
 
                     Ok(())
                 }
                 (Value::String(body), Value::Number(count)) => {
-                    for _ in 0..count as i64 {
-                        self.evaluate(&body)?;
+                    for i in 0..count as i64 {
+                        self.eval_with_context(
+                            &body,
+                            global_source,
+                            Some(LoopContext {
+                                element: Value::Number(i as f64),
+                                iteration: Value::Number(i as f64),
+                            }),
+                        )?;
                     }
 
                     Ok(())
@@ -248,6 +290,28 @@ impl Interpreter {
                 self.push(self.peek(0));
                 Ok(())
             }
+            Token::Instruction(Instruction::PushLoopIteration) => {
+                if let Some(LoopContext { iteration, .. }) = loop_context {
+                    self.push(iteration);
+                } else {
+                    return Err(anyhow::anyhow!(
+                        "No loop context available for push loop iteration"
+                    ));
+                }
+
+                Ok(())
+            }
+            Token::Instruction(Instruction::PushLoopElement) => {
+                if let Some(LoopContext { element, .. }) = loop_context {
+                    self.push(element);
+                } else {
+                    return Err(anyhow::anyhow!(
+                        "No loop context available for push loop element"
+                    ));
+                }
+
+                Ok(())
+            }
             Token::Instruction(Instruction::PushN) => {
                 let count = match self.pop() {
                     Value::Number(n) => n as usize,
@@ -263,6 +327,10 @@ impl Interpreter {
                 let values = (0..count).map(|i| self.peek(i)).collect::<Vec<Value>>();
                 self.stack.extend(values.into_iter().rev());
 
+                Ok(())
+            }
+            Token::Instruction(Instruction::PushSource) => {
+                self.push(Value::String(global_source.to_string()));
                 Ok(())
             }
             Token::Instruction(Instruction::RangeTo) => {
@@ -380,7 +448,12 @@ mod operator {
         fn apply_binary_operator(lhs: Value, rhs: Value) -> anyhow::Result<Value> {
             match (lhs, rhs) {
                 (Value::Number(lhs), Value::Number(rhs)) => Ok(Value::Number(lhs * rhs)),
-                _ => Err(anyhow::anyhow!("Invalid types for multiplication")),
+                (Value::Number(n), Value::String(s)) => Ok(Value::String(s.repeat(n as usize))),
+                (lhs, rhs) => Err(anyhow::anyhow!(
+                    "Invalid types for multiplication ({} and {})",
+                    lhs.typeid(),
+                    rhs.typeid()
+                )),
             }
         }
     }
@@ -507,6 +580,11 @@ mod parser {
 
             match self.inner_iter.peek().cloned() {
                 Some((char_offset, c)) => match c {
+                    '\n' => {
+                        self.line_number += 1;
+                        self.inner_iter.next();
+                        self.next()
+                    }
                     '0'..='9' => {
                         let mut number = String::new();
                         while let Some((_, c)) = self.inner_iter.peek() {
@@ -526,10 +604,26 @@ mod parser {
 
                         Some(Ok((span, Token::NumberLiteral(number.parse().unwrap()))))
                     }
-                    '\n' => {
-                        self.line_number += 1;
+                    '"' => {
                         self.inner_iter.next();
-                        self.next()
+                        let mut string = String::new();
+                        while let Some((_, c)) = self.inner_iter.peek() {
+                            if *c == '"' {
+                                self.inner_iter.next();
+                                break;
+                            } else {
+                                string.push(*c);
+                                self.inner_iter.next();
+                            }
+                        }
+
+                        let span = Span {
+                            line_number: self.line_number,
+                            char_offset,
+                            length: string.len(),
+                        };
+
+                        Some(Ok((span, Token::StringLiteral(string))))
                     }
                     '{' => {
                         self.inner_iter.next();

@@ -35,6 +35,7 @@ As a stack-based language, most operations involve pushing and popping values fr
 | Literal  | Description |
 |:--------:|-------------|
 | `[0-9]+` | Pushes the corresponding base-10 number to the stack. |
+| `".*"`   | Pushes the string between the quotations to the stack. Implicitly terminated by EOF. |
 
 ### Range Operations
 | Operator | Description |
@@ -61,7 +62,11 @@ As a stack-based language, most operations involve pushing and popping values fr
 ### Special Operators
 | Operator | Description |
 |:--------:|-------------|
-| `$`      | Pops a string off the stack and evaluates it as source code on the existing stack. |
+| `E`      | Pops a string off the stack and evaluates it as source code on the existing stack. |
+| `$`      | Push the program source as a string on the stack. |
+| `#`      | Push the current loop iteration on the stack. |
+| `_`      | Push the current loop element on the stack, if iterating over a list or range. |
+| `{`      | Capture the string between `{` and the subsequent `}` (or EOF). Pop a value off the stack and iterate through it, executing the string each iteration. |
 
 ### Special Behaviors
  - **Termination**: Values left on the stack at the end of the program are printed to the console separated by new
@@ -71,3 +76,5 @@ As a stack-based language, most operations involve pushing and popping values fr
    `0` is used in place of any missing values.
  - **Ranges**: When used in arithmetic operations, ranges are treated as lists containing the integers represented
    by the range.
+ - **Iteration**: Iteration over a range or list is done in the order the elements appear in the range or list. Iteration
+    over a number `n` is performed by iterating over the range `[0, n)`.
